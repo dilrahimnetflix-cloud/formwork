@@ -107,17 +107,37 @@ input[type=number],input[type=text]{width:100%;background:var(--panel2);border:1
 .profile-card:active{transform:scale(.98);}
 .addperson-card{display:flex;align-items:center;justify-content:center;gap:10px;padding:16px;border-radius:16px;border:1.5px dashed var(--line);color:var(--ink-dim);cursor:pointer;}
 .suggest-banner{position:absolute;left:16px;right:16px;bottom:16px;background:rgba(20,26,32,.95);border:1px solid var(--effort);border-radius:16px;padding:14px;display:flex;align-items:center;gap:12px;}
+.pause-fab{position:absolute;top:16px;right:16px;width:44px;height:44px;border-radius:50%;background:rgba(20,26,32,.85);border:1px solid var(--line);color:var(--ink);display:flex;align-items:center;justify-content:center;font-size:16px;z-index:25;backdrop-filter:blur(6px);}
+.pause-fab:active{transform:scale(.94);}
+.paused-screen{min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:28px 24px;background:radial-gradient(120% 90% at 50% -10%, #151C23 0%, var(--void) 55%);}
+.rest-adjust-row{display:flex;gap:10px;margin-top:14px;width:100%;}
+.rest-adjust-row .btn{flex:1;padding:12px;font-size:14px;}
+.modal-backdrop{position:fixed;inset:0;background:rgba(5,7,8,.72);display:flex;align-items:center;justify-content:center;z-index:300;padding:20px;}
+.modal-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px;max-width:340px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5);}
+.modal-card h3{margin:0 0 8px;font-size:19px;}
+.modal-card p{margin:0 0 20px;color:var(--ink-dim);font-size:14px;line-height:1.5;}
+.modal-actions{display:flex;flex-direction:column;gap:10px;}
 </style>
 </head>
 <body>
 <div id="root"></div>
 <canvas id="motionCanvas" width="64" height="48" class="hidden"></canvas>
 
-<script>
+<script type="module">
 /* =========================================================================
    FORMWORK — 24-week adaptive AI training coach, multi-profile edition
    Single-file prototype. Persistence via window.storage (in-memory fallback).
    ========================================================================= */
+import { WorkoutEngine, WorkoutStatus } from './lib/workout-engine.mjs';
+import { RunEngine, RunStatus } from './lib/running-engine.mjs';
+
+// Centralized state machines (see lib/workout-engine.mjs, lib/running-engine.mjs).
+// The UI below drives these rather than hand-rolling pause/resume/timer logic —
+// this is what makes PAUSE/RESUME/RESTART/END and interruption recovery
+// (screen lock, backgrounding, refresh) behave correctly instead of on a
+// per-screen, best-effort basis.
+let workoutEngine = new WorkoutEngine();
+let runEngine = new RunEngine();
 
 const MemStore = {};
 const LS_PREFIX = 'formwork:';
@@ -927,7 +947,7 @@ const App = {
     demoMode:true, tab:'today',
     workout:null, runSession:null, history:[],
     toast:null, weightInsight:null, faceSuggestion:null,
-    onboardingDraft:{},
+    onboardingDraft:{}, modal:null,
   },
   async init(){
     FaceID.init(); // fire and forget, non-blocking
@@ -936,7 +956,8 @@ const App = {
     const lastActive = await Store.get('active-profile');
     if(lastActive && this.state.profiles.find(p=>p.id===lastActive)){
       await loadProfileData(lastActive);
-      this.set({screen:'dashboard'});
+      const recovered = await checkForRecoverableSession();
+      this.set({screen: recovered || 'dashboard'});
     } else {
       this.set({screen:'who'});
     }
@@ -1402,6 +1423,7 @@ function screenCountdown(){
 function screenLive(){
   const w=App.state.workout; const ex=EXERCISES[w.plan[w.idx].exId]; const plan=w.plan[w.idx];
   const isHold = plan.holdSec!=null;
+  const startReps = w.currentReps||0;
   return `<div class="live-screen">
     <div class="cam-wrap" id="camWrap">
       <video id="camVideo" autoplay playsinline muted></video>
@@ -1410,17 +1432,61 @@ function screenLive(){
         <span class="chip">DAY ${w.dayKey} · SET ${w.setNum}/${plan.sets}</span>
         <span class="chip" id="confChip">CONF —</span>
       </div>
+      <button class="pause-fab" data-action="pause-workout" aria-label="Pause workout">⏸</button>
       <div class="live-hud-bottom">
-        <div class="disp" style="font-size:14px;color:var(--ink-dim);">${ex.name.toUpperCase()}</div>
+        <div class="row"><span class="disp" style="font-size:14px;color:var(--ink-dim);">${ex.name.toUpperCase()}</span><span class="mono dim" style="font-size:12px;">WORKOUT ${fmtSec(w.remainingSeconds||0)} LEFT</span></div>
         ${isHold
-          ? `<div class="rep-big" id="liveMain">0:00 <span style="font-size:24px;color:var(--ink-dim);">/ ${fmtSec(plan.holdSec)}</span></div>`
-          : `<div class="rep-big"><span id="liveMain">0</span><span style="font-size:24px;color:var(--ink-dim);"> / ${plan.reps}</span></div>`
+          ? `<div class="rep-big" id="liveMain">${fmtSec(startReps)} <span style="font-size:24px;color:var(--ink-dim);">/ ${fmtSec(plan.holdSec)}</span></div>`
+          : `<div class="rep-big"><span id="liveMain">${startReps}</span><span style="font-size:24px;color:var(--ink-dim);"> / ${plan.reps}</span></div>`
         }
         <div id="cueText" style="min-height:20px;font-size:14px;color:var(--recovery);margin-top:2px;">Analyzing…</div>
         <div class="row" style="margin-top:8px;"><span class="eyebrow">FORM</span><span class="mono" id="formPct">—</span></div>
         <div class="form-bar"><div class="form-bar-fill" id="formFill" style="width:0%;background:var(--recovery);"></div></div>
         <button class="btn btn-ghost btn-block" style="margin-top:14px;" data-action="end-set">End set</button>
       </div>
+    </div>
+  </div>`;
+}
+
+/** Full-screen PAUSED state (section 4/5/11). Branches on whether the
+ *  pause happened mid-set (ACTIVE) or mid-rest (RESTING) so rest gets its
+ *  own resume/restart-rest/skip controls instead of restarting the whole
+ *  workout. */
+function screenPaused(){
+  const w = App.state.workout; const plan = w.plan[w.idx]; const ex = EXERCISES[plan.exId];
+  const wasResting = w.pausedFrom==='RESTING';
+  return `<div class="paused-screen">
+    <div class="eyebrow">${wasResting?'PAUSED · REST':'PAUSED'}</div>
+    ${wasResting
+      ? `<div class="disp" style="font-size:44px;margin:10px 0;">${fmtSec(w.restRemaining)}</div>`
+      : ''}
+    <div class="h2" style="margin-top:8px;">${ex.name}</div>
+    <div class="dim mono" style="margin-top:6px;">SET ${w.setNum} / ${plan.sets}${plan.holdSec==null?` · ${w.currentReps} / ${plan.reps} REPS`:''}</div>
+    <div class="dim mono" style="margin-top:4px;font-size:12px;">WORKOUT ELAPSED ${fmtSec(w.elapsedSeconds||0)}</div>
+    <div style="width:100%;margin-top:28px;display:flex;flex-direction:column;gap:10px;">
+      <button class="btn btn-primary btn-block" data-action="resume-workout">RESUME${wasResting?' REST':''}</button>
+      ${wasResting?`<button class="btn btn-secondary btn-block" data-action="restart-rest-from-pause">RESTART REST</button><button class="btn btn-secondary btn-block" data-action="skip-rest-from-pause">SKIP REST</button>`:''}
+      <button class="btn btn-ghost btn-block" data-action="open-restart-confirm">RESTART WORKOUT</button>
+      <button class="btn btn-ghost btn-block" data-action="open-end-workout-confirm">END WORKOUT</button>
+    </div>
+  </div>`;
+}
+
+/** Interruption-recovery prompt (section 8) — shown at app boot instead of
+ *  silently resuming or discarding when a snapshot from a killed tab /
+ *  locked screen / lost connection is found. */
+function screenResumeWorkoutPrompt(){
+  const w = App.state.workout; const plan = w.plan[w.idx]; const ex = EXERCISES[plan.exId];
+  return `<div class="paused-screen">
+    <div class="eyebrow">RESUME WORKOUT?</div>
+    <div class="h2" style="margin-top:10px;">${ex.name}</div>
+    <div class="dim mono" style="margin-top:6px;">SET ${w.setNum} / ${plan.sets}${plan.holdSec==null?` · ${w.currentReps} / ${plan.reps} REPS`:''}</div>
+    <div class="dim mono" style="margin-top:4px;font-size:12px;">WORKOUT PAUSED AT ${fmtSec(w.elapsedSeconds||0)}</div>
+    <p class="dim" style="margin-top:16px;font-size:13px;">Your last session on this device didn't finish — maybe the screen locked or the tab closed. Nothing was lost.</p>
+    <div style="width:100%;margin-top:20px;display:flex;flex-direction:column;gap:10px;">
+      <button class="btn btn-primary btn-block" data-action="resume-workout">RESUME</button>
+      <button class="btn btn-ghost btn-block" data-action="open-restart-confirm">RESTART</button>
+      <button class="btn btn-ghost btn-block" data-action="open-end-workout-confirm">END WORKOUT</button>
     </div>
   </div>`;
 }
@@ -1439,15 +1505,20 @@ function screenSetComplete(){
 function screenRest(){
   const w=App.state.workout;
   const nextEx = w.restNextIsNewExercise ? EXERCISES[w.plan[Math.min(w.idx+1,w.plan.length-1)].exId] : EXERCISES[w.plan[w.idx].exId];
-  return `<div class="pad" style="min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;">
+  return `<div class="pad" style="min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;position:relative;">
+    <button class="pause-fab" data-action="pause-workout" aria-label="Pause rest">⏸</button>
     <div class="eyebrow">REST</div>
-    ${ring(1,'var(--recovery)',180,10,`<div class="disp" id="restNum" style="font-size:44px;">${fmtSec(w.restRemaining)}</div>`)}
+    ${ring(w.restDurationSec? w.restRemaining/w.restDurationSec : 0,'var(--recovery)',180,10,`<div class="disp" id="restNum" style="font-size:44px;">${fmtSec(w.restRemaining)}</div>`)}
     <p class="dim" style="margin-top:18px;">Breathe, walk it off, sip water.</p>
     <div class="card2" style="margin-top:18px;width:100%;">
       <div class="eyebrow">Next</div>
       <div style="font-size:17px;margin-top:4px;">${nextEx.name}</div>
     </div>
-    <button class="btn btn-secondary btn-block" style="margin-top:16px;" data-action="skip-rest">Skip rest</button>
+    <div class="rest-adjust-row">
+      <button class="btn btn-ghost" data-action="sub-rest-15">−15 SEC</button>
+      <button class="btn btn-ghost" data-action="add-rest-15">+15 SEC</button>
+    </div>
+    <button class="btn btn-secondary btn-block" style="margin-top:10px;" data-action="skip-rest">Skip rest</button>
   </div>`;
 }
 
@@ -1548,15 +1619,47 @@ function screenRunLive(){
   const nextSeg = r.plan.segments[r.idx+1];
   const pct = 1 - (r.remaining/seg.sec);
   const color = seg.type==='walk' ? 'var(--recovery)' : 'var(--effort)';
-  return `<div class="pad" style="min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;background:#000;">
+  return `<div class="pad" style="min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;background:#000;position:relative;">
+    <button class="pause-fab" data-action="pause-run" aria-label="Pause run">⏸</button>
     <div class="eyebrow">SEGMENT ${r.idx+1} / ${r.plan.segments.length}</div>
     ${ring(pct, color, 220, 12, `
       <div class="disp" style="font-size:15px;color:${color};text-transform:uppercase;">${seg.type}</div>
       <div class="disp" style="font-size:46px;">${fmtSec(r.remaining)}</div>
-      <div class="mono dim" style="font-size:13px;">SPEED ${fmtSpeed(seg.speed)} mph</div>
+      <div class="mono dim" style="font-size:13px;">SPEED ${fmtSpeed(seg.speed)} mph · ${(r.distanceKm||0).toFixed(2)} km</div>
     `)}
     ${nextSeg? `<p class="dim" style="margin-top:20px;">Next: <b style="color:var(--ink);text-transform:capitalize;">${nextSeg.type}</b> at ${fmtSpeed(nextSeg.speed)} mph</p>` : `<p class="dim" style="margin-top:20px;">Final segment — cool down.</p>`}
-    <button class="btn btn-ghost btn-block" style="margin-top:24px;max-width:280px;" data-action="end-run-early">End run</button>
+    <button class="btn btn-ghost btn-block" style="margin-top:24px;max-width:280px;" data-action="open-end-run-confirm">End run</button>
+  </div>`;
+}
+
+function screenRunPaused(){
+  const r = App.state.runSession; const seg = r.plan.segments[r.idx];
+  return `<div class="paused-screen">
+    <div class="eyebrow">RUN PAUSED</div>
+    <div class="h2" style="margin-top:10px;text-transform:capitalize;">${seg.type} segment</div>
+    <div class="dim mono" style="margin-top:6px;">SEGMENT ${r.idx+1} / ${r.plan.segments.length} · ${fmtSec(r.remaining)} LEFT</div>
+    <div class="dim mono" style="margin-top:4px;font-size:12px;">DISTANCE ${(r.distanceKm||0).toFixed(2)} KM · ELAPSED ${fmtSec(r.elapsedActive||0)}</div>
+    <div style="width:100%;margin-top:28px;display:flex;flex-direction:column;gap:10px;">
+      <button class="btn btn-primary btn-block" data-action="resume-run">RESUME</button>
+      <button class="btn btn-ghost btn-block" data-action="open-restart-run-confirm">RESTART RUN</button>
+      <button class="btn btn-ghost btn-block" data-action="open-end-run-confirm">END RUN</button>
+    </div>
+  </div>`;
+}
+
+function screenResumeRunPrompt(){
+  const r = App.state.runSession; const seg = r.plan.segments[r.idx];
+  return `<div class="paused-screen">
+    <div class="eyebrow">RESUME RUN?</div>
+    <div class="h2" style="margin-top:10px;text-transform:capitalize;">${seg.type} segment</div>
+    <div class="dim mono" style="margin-top:6px;">SEGMENT ${r.idx+1} / ${r.plan.segments.length} · ${fmtSec(r.remaining)} LEFT</div>
+    <div class="dim mono" style="margin-top:4px;font-size:12px;">DISTANCE ${(r.distanceKm||0).toFixed(2)} KM · ELAPSED ${fmtSec(r.elapsedActive||0)}</div>
+    <p class="dim" style="margin-top:16px;font-size:13px;">Your last run on this device didn't finish. Nothing was lost.</p>
+    <div style="width:100%;margin-top:20px;display:flex;flex-direction:column;gap:10px;">
+      <button class="btn btn-primary btn-block" data-action="resume-run">RESUME</button>
+      <button class="btn btn-ghost btn-block" data-action="open-restart-run-confirm">RESTART</button>
+      <button class="btn btn-ghost btn-block" data-action="open-end-run-confirm">END RUN</button>
+    </div>
   </div>`;
 }
 
@@ -1600,19 +1703,73 @@ function render(){
     case 'live': html = screenLive(); break;
     case 'set-complete': html = screenSetComplete(); break;
     case 'rest': html = screenRest(); break;
+    case 'paused': html = screenPaused(); break;
+    case 'resume-workout-prompt': html = screenResumeWorkoutPrompt(); break;
     case 'workout-complete': html = screenWorkoutComplete(); break;
     case 'feedback': html = screenFeedback(); break;
     case 'generating': html = screenGenerating(); break;
     case 'ai-report': html = screenAIReport(); break;
     case 'run-intro': html = screenRunIntro(); break;
     case 'run-live': html = screenRunLive(); break;
+    case 'run-paused': html = screenRunPaused(); break;
+    case 'resume-run-prompt': html = screenResumeRunPrompt(); break;
     case 'run-complete': html = screenRunComplete(); break;
     default: html = `<div class="pad">Unknown screen</div>`;
   }
+  if(s.modal) html += screenModal(s.modal);
   if(s.toast) html = `<div class="toast">${s.toast}</div>` + html;
   root.innerHTML = html;
   wire();
   postRenderHooks();
+}
+
+/** Confirmation dialogs (sections 6/7/21) — rendered as an overlay on top
+ *  of the current screen rather than a navigation, since cancelling must
+ *  return to exactly where the user was. */
+function screenModal(kind){
+  if(kind==='restart-workout'){
+    return `<div class="modal-backdrop"><div class="modal-card">
+      <h3>Restart workout?</h3>
+      <p>Your current workout progress will be discarded. This can't be undone.</p>
+      <div class="modal-actions">
+        <button class="btn btn-primary btn-block" data-action="confirm-restart-workout">RESTART</button>
+        <button class="btn btn-ghost btn-block" data-action="cancel-modal">CANCEL</button>
+      </div>
+    </div></div>`;
+  }
+  if(kind==='end-workout'){
+    return `<div class="modal-backdrop"><div class="modal-card">
+      <h3>End workout?</h3>
+      <p>Save what you've completed so far, or discard this session.</p>
+      <div class="modal-actions">
+        <button class="btn btn-primary btn-block" data-action="confirm-end-workout-save">SAVE &amp; EXIT</button>
+        <button class="btn btn-ghost btn-block" data-action="confirm-end-workout-discard">DISCARD</button>
+        <button class="btn btn-ghost btn-block" data-action="cancel-modal">CANCEL</button>
+      </div>
+    </div></div>`;
+  }
+  if(kind==='restart-run'){
+    return `<div class="modal-backdrop"><div class="modal-card">
+      <h3>Restart run?</h3>
+      <p>Your current run progress will be discarded. This can't be undone.</p>
+      <div class="modal-actions">
+        <button class="btn btn-primary btn-block" data-action="confirm-restart-run">RESTART</button>
+        <button class="btn btn-ghost btn-block" data-action="cancel-modal">CANCEL</button>
+      </div>
+    </div></div>`;
+  }
+  if(kind==='end-run'){
+    return `<div class="modal-backdrop"><div class="modal-card">
+      <h3>End run?</h3>
+      <p>Save what you've completed so far, or discard this session.</p>
+      <div class="modal-actions">
+        <button class="btn btn-primary btn-block" data-action="confirm-end-run-save">SAVE &amp; EXIT</button>
+        <button class="btn btn-ghost btn-block" data-action="confirm-end-run-discard">DISCARD</button>
+        <button class="btn btn-ghost btn-block" data-action="cancel-modal">CANCEL</button>
+      </div>
+    </div></div>`;
+  }
+  return '';
 }
 
 /* ---------------------------------------------------------------------
@@ -1640,7 +1797,8 @@ function wire(){
   document.querySelectorAll('[data-select-profile]').forEach(b=>b.onclick=async ()=>{
     stopSideCamera();
     await loadProfileData(b.dataset.selectProfile);
-    App.set({screen:'dashboard', tab:'today'});
+    const recovered = await checkForRecoverableSession();
+    App.set({screen: recovered || 'dashboard', tab:'today'});
   });
 
   const actionMap = {
@@ -1665,8 +1823,87 @@ function wire(){
     'start-run': startRun,
     'enable-marathon': enableMarathonPrep,
     'run-start': runStartSegments,
-    'end-run-early': ()=>finishRun(true),
     'finish-run-to-dashboard': ()=>App.set({screen:'dashboard', tab:'today'}),
+
+    // --- Pause / resume / restart / end (workout) — sections 4-11 ---
+    'pause-workout': ()=>{
+      workoutEngine.pauseWorkout();
+      syncWorkoutFromEngine();
+      persistWorkoutSnapshot();
+      App.set({screen:'paused'});
+    },
+    'resume-workout': ()=>{
+      workoutEngine.resumeWorkout();
+      syncWorkoutFromEngine();
+      persistWorkoutSnapshot();
+      const st = workoutEngine.getState();
+      App.set({screen: st.status===WorkoutStatus.RESTING ? 'rest' : 'live'});
+    },
+    'open-restart-confirm': ()=>App.set({modal:'restart-workout'}),
+    'open-end-workout-confirm': ()=>App.set({modal:'end-workout'}),
+    'cancel-modal': ()=>App.set({modal:null}),
+    'confirm-restart-workout': ()=>{
+      const {previousSnapshot} = workoutEngine.restartWorkout();
+      if(previousSnapshot.sessionLogs && previousSnapshot.sessionLogs.length){
+        App.pushHistory({type:'workout-abandoned', week:App.state.workout.week, dayKey:App.state.workout.dayKey, abandonedAt:Date.now(), sessionLogs:previousSnapshot.sessionLogs});
+      }
+      syncWorkoutFromEngine();
+      persistWorkoutSnapshot();
+      App.set({screen:'exercise-intro', modal:null});
+    },
+    'confirm-end-workout-save': ()=>{
+      workoutEngine.endWorkout('save');
+      syncWorkoutFromEngine();
+      App.set({modal:null});
+      finishWorkout();
+    },
+    'confirm-end-workout-discard': ()=>{
+      workoutEngine.endWorkout('discard');
+      clearWorkoutSnapshot();
+      App.set({screen:'dashboard', tab:'today', modal:null, workout:null});
+    },
+    'restart-rest-from-pause': ()=>{
+      workoutEngine.resumeWorkout();
+      workoutEngine.restartRest();
+      syncWorkoutFromEngine();
+      persistWorkoutSnapshot();
+      App.set({screen:'rest'});
+    },
+    'skip-rest-from-pause': ()=>{
+      workoutEngine.resumeWorkout();
+      endRestNow();
+    },
+    'add-rest-15': ()=>{ workoutEngine.addRestSeconds(15); syncWorkoutFromEngine(); App.set({}); },
+    'sub-rest-15': ()=>{ workoutEngine.addRestSeconds(-15); syncWorkoutFromEngine(); App.set({}); },
+
+    // --- Pause / resume / restart / end (run) — section 21 ---
+    'pause-run': ()=>{
+      runEngine.pauseRun();
+      syncRunFromEngine();
+      persistRunSnapshot();
+      App.set({screen:'run-paused'});
+    },
+    'resume-run': ()=>{
+      runEngine.resumeRun();
+      syncRunFromEngine();
+      persistRunSnapshot();
+      App.set({screen:'run-live'});
+    },
+    'open-restart-run-confirm': ()=>App.set({modal:'restart-run'}),
+    'open-end-run-confirm': ()=>App.set({modal:'end-run'}),
+    'confirm-restart-run': ()=>{
+      runEngine.restartRun();
+      syncRunFromEngine();
+      persistRunSnapshot();
+      _lastBeepRemaining = null;
+      App.set({screen:'run-live', modal:null});
+    },
+    'confirm-end-run-save': ()=>{ App.set({modal:null}); finishRun(true); },
+    'confirm-end-run-discard': ()=>{
+      runEngine.endRun('discard');
+      clearRunSnapshot();
+      App.set({screen:'dashboard', tab:'today', modal:null, runSession:null});
+    },
   };
   document.querySelectorAll('[data-action]').forEach(b=>{ const fn=actionMap[b.dataset.action]; if(fn) b.onclick=fn; });
 
@@ -1797,21 +2034,118 @@ async function saveWeightEntry(){
 /* ---------------------------------------------------------------------
    16. WORKOUT ENGINE / FLOW LOGIC
 --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   WORKOUT ENGINE <-> UI BRIDGE
+   The engine (lib/workout-engine.mjs) owns status/timers/rep count. This
+   copies its derived state onto App.state.workout so the existing screen
+   render functions (which read w.idx/w.setNum/etc.) keep working, and
+   persists a snapshot after every mutation so a refresh, backgrounded
+   tab, or locked screen can recover the exact session (never silently
+   restart — see checkForRecoverableSession()/screenResumePrompt()).
+--------------------------------------------------------------------- */
+function estimateWorkoutDurationSec(plan){
+  return plan.reduce((total, entry)=>{
+    const perRepSec = entry.holdSec!=null ? entry.holdSec : (entry.reps||10) * 3.2;
+    return total + entry.sets * (perRepSec + (entry.restSec||45));
+  }, 0);
+}
+function syncWorkoutFromEngine(now){
+  const w = App.state.workout; if(!w) return;
+  const st = workoutEngine.getState(now);
+  w.idx = st.exerciseIndex; w.setNum = st.setIndex; w.currentReps = st.currentReps;
+  w.status = st.status; w.pausedFrom = st.pausedFrom;
+  w.restRemaining = st.restRemainingSeconds; w.restDurationSec = st.restDurationSec;
+  w.restNextIsNewExercise = st.restNextIsNewExercise;
+  w.elapsedSeconds = st.elapsedSeconds; w.remainingSeconds = st.remainingSeconds;
+  w.sessionLogs = st.sessionLogs;
+  w.startedAt = Date.now() - st.elapsedSeconds*1000;
+}
+async function persistWorkoutSnapshot(){
+  if(!App.state.workout){ return; }
+  const w = App.state.workout;
+  const snap = workoutEngine.serialize();
+  snap.week = w.week; snap.dayKey = w.dayKey; snap.dayLabel = w.dayLabel;
+  await Store.set(k('workout-session-snapshot'), JSON.stringify(snap));
+}
+async function clearWorkoutSnapshot(){ await Store.set(k('workout-session-snapshot'), ''); }
+
+function syncRunFromEngine(now){
+  const r = App.state.runSession; if(!r) return;
+  const st = runEngine.getRunState(now);
+  r.idx = st.idx; r.status = st.status;
+  r.remaining = st.segmentRemainingSeconds; r.elapsedActive = st.elapsedActiveSeconds;
+  r.distanceKm = st.distanceKm; r.longestContinuousSec = st.longestContinuousSeconds;
+}
+async function persistRunSnapshot(){
+  if(!App.state.runSession){ return; }
+  const r = App.state.runSession;
+  const snap = runEngine.serialize();
+  snap.week = App.state.weekIdx; snap.planMeta = r.plan;
+  await Store.set(k('run-session-snapshot'), JSON.stringify(snap));
+}
+async function clearRunSnapshot(){ await Store.set(k('run-session-snapshot'), ''); }
+
+/** Called once after loading a profile (app boot, or profile switch). If an
+ *  interrupted workout or run is found, forces it into a frozen PAUSED
+ *  state (even if the interruption happened before an explicit pause —
+ *  e.g. a hard crash) and returns the screen to show; the caller must
+ *  never silently resume or discard it. */
+async function checkForRecoverableSession(){
+  const wRaw = await Store.get(k('workout-session-snapshot'));
+  if(wRaw){
+    try{
+      const snap = JSON.parse(wRaw);
+      const restored = WorkoutEngine.restore(snap);
+      if(restored.isRecoverable()){
+        workoutEngine = restored;
+        // Freeze at the moment this was last saved, not "now" — otherwise a
+        // crash that skipped the visibilitychange auto-pause would credit
+        // the entire time the app was closed as active training time.
+        if(workoutEngine.status!==WorkoutStatus.PAUSED) workoutEngine.pauseWorkout(snap.lastUpdatedAt || Date.now());
+        App.state.workout = {
+          week: snap.week, dayKey: snap.dayKey, dayLabel: snap.dayLabel, plan: snap.plan,
+          feedback:{difficulty:5, feel:'Normal', pain:null}, avgFormSoFar:null,
+        };
+        syncWorkoutFromEngine();
+        return 'resume-workout-prompt';
+      }
+    }catch(e){ console.warn('discarding unreadable workout snapshot', e); }
+  }
+  const rRaw = await Store.get(k('run-session-snapshot'));
+  if(rRaw){
+    try{
+      const snap = JSON.parse(rRaw);
+      const restored = RunEngine.restore(snap);
+      if(restored.isRecoverable()){
+        runEngine = restored;
+        if(runEngine.status!==RunStatus.PAUSED) runEngine.pauseRun(snap.lastUpdatedAt || Date.now());
+        App.state.runSession = { plan: snap.planMeta };
+        syncRunFromEngine();
+        return 'resume-run-prompt';
+      }
+    }catch(e){ console.warn('discarding unreadable run snapshot', e); }
+  }
+  return null;
+}
+
 function startWorkout(){
   const tw = todayWorkout();
+  const plan = tw.day.exercises;
   App.state.workout = {
     week: tw.week.week, dayKey: tw.day.dayKey, dayLabel: tw.day.label,
-    plan: tw.day.exercises, idx:0, setNum:1,
-    startedAt: Date.now(), sessionLogs: [], lastSet:null,
-    feedback:{difficulty:5, feel:'Normal', pain:null},
-    restNextIsNewExercise:false, restRemaining:0, avgFormSoFar:null,
+    plan, lastSet:null,
+    feedback:{difficulty:5, feel:'Normal', pain:null}, avgFormSoFar:null,
   };
+  workoutEngine.startWorkout(plan, { totalDurationEstimateSec: estimateWorkoutDurationSec(plan), transitionRestSec: 30 });
+  syncWorkoutFromEngine();
+  persistWorkoutSnapshot();
   App.set({screen:'exercise-intro'});
 }
 
 let liveEngine=null, liveTimer=null, liveStream=null, restInterval=null, countdownTimer=null;
 
 function stopLiveTimer(){ if(liveTimer){ clearInterval(liveTimer); liveTimer=null; } }
+function stopRestTimer(){ if(restInterval){ clearInterval(restInterval); restInterval=null; } }
 function stopCameraStream(){ if(liveStream){ liveStream.getTracks().forEach(t=>t.stop()); liveStream=null; } }
 
 const CAMERA_SCREENS = new Set(['position','countdown','live','set-complete','rest','exercise-intro','workout-complete']);
@@ -1819,6 +2153,7 @@ const CAMERA_SCREENS = new Set(['position','countdown','live','set-complete','re
 async function postRenderHooks(){
   const s = App.state;
   stopLiveTimer();
+  stopRestTimer();
   const inWorkout = !!s.workout && CAMERA_SCREENS.has(s.screen) && !s.demoMode;
   if(s.screen==='position' || s.screen==='live'){
     await setupCamera();
@@ -1878,6 +2213,13 @@ function runLiveExercise(){
   const formFillEl = ()=>document.getElementById('formFill');
   const confChip = ()=>document.getElementById('confChip');
 
+  // Never count a rep/hold-tick during camera initialization: a fresh
+  // engine instance always starts in its 'top'/zeroed state and requires
+  // a full new cycle before it fires — but the displayed number picks up
+  // exactly where the workout engine's persisted rep count left off, so
+  // resuming after a pause never looks like it reset to zero.
+  const alreadyReps = workoutEngine.getState().currentReps || 0;
+
   if(ex.rep.type==='hold'){
     const target = plan.holdSec;
     liveEngine = new HoldEngine(ex, target, {
@@ -1886,14 +2228,20 @@ function runLiveExercise(){
         if(confChip()) confChip().textContent = 'CONF ' + Math.round(conf*100)+'%';
         if(conf>0.25){ if(cueEl()) cueEl().textContent = stable? 'Holding steady — good.' : 'Re-brace: keep the line straight.'; if(formFillEl()){ formFillEl().style.width = (stable?92:70)+'%'; formFillEl().style.background = stable? 'var(--recovery)':'var(--effort)'; } if(formPctEl()) formPctEl().textContent=(stable?92:70)+'%'; }
         else { if(cueEl()) cueEl().textContent='Analyzing…'; }
+        workoutEngine.setReps(Math.floor(elapsed));
+        syncWorkoutFromEngine();
         if(elapsed>=target){ finishCurrentSet(false); }
       }
     });
+    liveEngine.elapsed = alreadyReps;
   } else {
     liveEngine = new RepEngine(ex, {
       onRep:(count,quality,conf)=>{
         if(mainEl()) mainEl().textContent = count;
         if(navigator.vibrate) try{navigator.vibrate(15);}catch(e){}
+        workoutEngine.setReps(count);
+        syncWorkoutFromEngine();
+        persistWorkoutSnapshot();
         if(count>=plan.reps){ finishCurrentSet(false); }
       },
       onPartial:()=>{ if(cueEl()) cueEl().textContent = 'Partial rep — go slightly deeper.'; },
@@ -1909,6 +2257,8 @@ function runLiveExercise(){
         }
       }
     });
+    liveEngine.reps = alreadyReps;
+    if(mainEl()) mainEl().textContent = alreadyReps;
   }
 
   liveTimer = setInterval(()=>{
@@ -1922,57 +2272,50 @@ function finishCurrentSet(manual){
   const w = App.state.workout; const plan = w.plan[w.idx]; const ex=EXERCISES[plan.exId];
   let setResult;
   if(ex.rep.type==='hold'){
-    setResult = {reps:null, target:null, holdSec: liveEngine? liveEngine.elapsed : 0, formPct: 85};
+    setResult = {holdSec: liveEngine? liveEngine.elapsed : 0, formPct: 85};
   } else {
     const reps = liveEngine? liveEngine.reps : 0;
-    setResult = {reps, target: plan.reps, formPct: liveEngine? liveEngine.formScore : 80};
+    setResult = {reps, formPct: liveEngine? liveEngine.formScore : 80};
   }
-  w.lastSet = setResult;
-  w.sessionLogs.push({exId:plan.exId, setNum:w.setNum, ...setResult});
+  workoutEngine.completeSet(setResult);
+  syncWorkoutFromEngine();
+  w.lastSet = { ...w.sessionLogs[w.sessionLogs.length-1] };
+  persistWorkoutSnapshot();
   App.set({screen:'set-complete'});
 }
 
 function continueAfterSet(){
-  const w = App.state.workout; const plan = w.plan[w.idx];
-  if(w.setNum < plan.sets){
-    w.setNum++;
-    w.restNextIsNewExercise = false;
-    w.restRemaining = plan.restSec;
-    App.set({screen:'rest'});
-  } else {
-    advanceToNextExercise();
-  }
+  const st = workoutEngine.getState();
+  if(st.status===WorkoutStatus.COMPLETED){ finishWorkout(); return; }
+  App.set({screen:'rest'});
 }
 
 function advanceToNextExercise(){
-  const w = App.state.workout;
-  if(w.idx < w.plan.length-1){
-    w.idx++; w.setNum=1;
-    w.restNextIsNewExercise = true;
-    w.restRemaining = 30;
-    App.set({screen: (App.state.screen==='exercise-intro')? 'exercise-intro' : 'rest'});
-    if(App.state.screen!=='exercise-intro'){} // rest first, then intro after rest completes
-  } else {
-    finishWorkout();
-  }
+  const st = workoutEngine.skipExercise();
+  syncWorkoutFromEngine();
+  persistWorkoutSnapshot();
+  if(st.status===WorkoutStatus.COMPLETED){ finishWorkout(); }
+  else { App.set({screen:'exercise-intro'}); }
 }
 
 function runRest(){
   clearInterval(restInterval);
-  const w = App.state.workout;
-  const tick = ()=>{
-    w.restRemaining -= 1;
+  restInterval = setInterval(()=>{
+    if(App.state.screen!=='rest') return;
+    const st = workoutEngine.getState();
+    if(st.status!==WorkoutStatus.RESTING) return; // paused mid-rest — frozen, nothing to tick
+    if(st.restRemainingSeconds<=0){ endRestNow(); return; }
     const numEl = document.getElementById('restNum');
-    if(numEl) numEl.textContent = fmtSec(w.restRemaining);
-    if(w.restRemaining<=0){ endRestNow(); }
-  };
-  restInterval = setInterval(tick, 1000);
+    if(numEl) numEl.textContent = fmtSec(st.restRemainingSeconds);
+  }, 250);
 }
 function endRestNow(){
   clearInterval(restInterval);
-  const w = App.state.workout;
-  if(w.restNextIsNewExercise){ App.set({screen:'exercise-intro'}); }
-  else { App.set({screen:'live'}); }
+  const wasNewExercise = workoutEngine.getState().restNextIsNewExercise;
+  workoutEngine.skipRest();
+  syncWorkoutFromEngine();
+  persistWorkoutSnapshot();
+  App.set({screen: wasNewExercise ? 'exercise-intro' : 'live'});
 }
 
 function finishWorkout(){
@@ -1994,7 +2337,9 @@ function finishWorkout(){
   const completedReps = exercises.reduce((a,e)=>a + w.sessionLogs.filter(l=>l.exId===e.exId).reduce((x,l)=>x + (l.reps!=null?Math.min(l.reps,l.target||1):(l.target||1)),0),0);
   const avgForm = Math.round(exercises.reduce((a,e)=>a+e.avgForm,0)/Math.max(1,exercises.length));
   w.avgFormSoFar = avgForm;
-  w.performance = {week:w.week, dayKey:w.dayKey, plannedReps, completedReps, avgForm, exercises, painReported:null};
+  const incomplete = w.idx < w.plan.length-1 || w.sessionLogs.length===0;
+  w.performance = {week:w.week, dayKey:w.dayKey, plannedReps, completedReps, avgForm, exercises, painReported:null, incomplete};
+  clearWorkoutSnapshot();
   App.set({screen:'workout-complete'});
 }
 
@@ -2049,42 +2394,44 @@ function beep(freq, ms){
 }
 function startRun(){
   const plan = App.state.marathon.weeks[App.state.weekIdx-1];
-  App.state.runSession = {plan, idx:0, remaining:plan.segments[0].sec, startedAt:null, elapsedActive:0, longestContinuousSec:0, currentContinuousSec:0};
+  App.state.runSession = {plan, idx:0, remaining:plan.segments[0].sec, elapsedActive:0, longestContinuousSec:0, distanceKm:0};
   App.set({screen:'run-intro'});
 }
+let _lastBeepRemaining = null;
 function runStartSegments(){
   const r = App.state.runSession;
-  r.startedAt = Date.now();
+  runEngine.startRun(r.plan.segments);
+  syncRunFromEngine();
+  persistRunSnapshot();
+  _lastBeepRemaining = null;
   App.set({screen:'run-live'});
   clearInterval(runInterval);
   beep(880,150);
   runInterval = setInterval(runTick, 1000);
 }
 function runTick(){
+  if(App.state.screen!=='run-live') return;
   const r = App.state.runSession; if(!r) return;
-  const seg = r.plan.segments[r.idx];
-  r.remaining -= 1; r.elapsedActive += 1;
-  if(seg.type!=='walk'){ r.currentContinuousSec += 1; r.longestContinuousSec = Math.max(r.longestContinuousSec, r.currentContinuousSec); }
-  else { r.currentContinuousSec = 0; }
-  if(r.remaining<=3 && r.remaining>0){ beep(660,90); }
-  if(r.remaining<=0){
-    r.idx += 1;
-    if(r.idx >= r.plan.segments.length){ finishRun(false); return; }
-    r.remaining = r.plan.segments[r.idx].sec;
-    beep(880,150);
-  }
-  const numEl = document.querySelector('.ring-center .disp:nth-child(2)');
-  if(App.state.screen==='run-live') render();
+  const before = runEngine.getRunState();
+  const {finished} = runEngine.tick();
+  const after = runEngine.getRunState();
+  syncRunFromEngine();
+  persistRunSnapshot();
+  const remainingInt = Math.round(after.segmentRemainingSeconds);
+  if(remainingInt<=3 && remainingInt>0 && remainingInt!==_lastBeepRemaining){ beep(660,90); }
+  if(after.idx!==before.idx && !finished){ beep(880,150); }
+  _lastBeepRemaining = remainingInt;
+  if(finished){ finishRun(false); return; }
+  render();
 }
 function finishRun(early){
   clearInterval(runInterval); runInterval=null;
   const r = App.state.runSession;
-  const actualMinutes = r.elapsedActive/60;
-  const actualKm = Math.round(r.plan.segments.reduce((a,s,i)=>{
-    const secDone = i<r.idx ? s.sec : (i===r.idx ? Math.max(0,s.sec-r.remaining) : 0);
-    return a + s.speed*(secDone/3600);
-  },0)*10)/10;
-  const longestContinuousMin = Math.round(r.longestContinuousSec/60*10)/10;
+  const st = runEngine.endRun('save');
+  syncRunFromEngine();
+  const actualMinutes = st.elapsedActiveSeconds/60;
+  const actualKm = Math.round(st.distanceKm*10)/10;
+  const longestContinuousMin = Math.round(st.longestContinuousSeconds/60*10)/10;
   r.actualMinutes = actualMinutes; r.actualKm = actualKm; r.longestContinuousMin = longestContinuousMin;
   r.note = early ? 'Session ended early — logged what you completed.' : 'Full session complete.';
 
@@ -2098,6 +2445,7 @@ function finishRun(early){
     type:'run', week:App.state.weekIdx, completedAt:Date.now(),
     minutes:Math.round(actualMinutes), estKm:actualKm, longestContinuousMin,
   });
+  clearRunSnapshot();
   App.set({screen:'run-complete'});
 }
 
@@ -2136,8 +2484,35 @@ function drawWeightChart(){
 }
 
 /* ---------------------------------------------------------------------
+   INTERRUPTION RECOVERY — section 8: a locked screen, a backgrounded
+   tab, or a switched app must never keep the workout/run "silently"
+   running, nor silently discard it. Auto-pause the moment the page is
+   hidden; resuming is always an explicit user action.
+--------------------------------------------------------------------- */
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden) return;
+  if(App.state.workout && (workoutEngine.status===WorkoutStatus.ACTIVE || workoutEngine.status===WorkoutStatus.RESTING)){
+    workoutEngine.pauseForInterruption();
+    syncWorkoutFromEngine();
+    persistWorkoutSnapshot();
+    if(App.state.screen==='live' || App.state.screen==='rest'){ App.set({screen:'paused'}); }
+  }
+  if(App.state.runSession && runEngine.status===RunStatus.ACTIVE){
+    runEngine.pauseRun();
+    syncRunFromEngine();
+    persistRunSnapshot();
+    if(App.state.screen==='run-live'){ App.set({screen:'run-paused'}); }
+  }
+});
+
+/* ---------------------------------------------------------------------
    19. BOOT
 --------------------------------------------------------------------- */
+// Debug/test hook only — module scripts don't leak top-level bindings onto
+// `window`, so this is the one intentional seam for external inspection
+// (e.g. an end-to-end test driving the page) without affecting app logic.
+window.__FW_DEBUG__ = { getAppState: () => App.state, getWorkoutEngine: () => workoutEngine, getRunEngine: () => runEngine };
+
 App.init();
 </script>
 </body>
